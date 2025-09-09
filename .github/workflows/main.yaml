@@ -1,0 +1,17 @@
+on: 
+  push:
+    branches: [ release, '*' ]
+jobs:
+  Master_job:
+    if: github.ref == 'refs/heads/release'
+    uses: gaiangroup/workflow-manager/.github/workflows/node-release.yml@dev 
+    with:
+      SERVICE_CODE: solidity-compiler      
+    secrets: inherit
+  
+  unauthorized_branch_job:
+    if: github.ref != 'refs/heads/release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: This is not an authorized branch, please Run on release Branch
+        run: echo "This is not an authorized branch. please Run on release Branch"

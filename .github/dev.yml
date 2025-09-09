@@ -1,0 +1,99 @@
+# This workflow to test EKS connections and deploy service in kubernetes cluster.
+# Authors : Rahul Upadhyay,Ravi Teja.
+
+name: CI with Java Spring Boot repo, maven build tool, packaging & pushing as image to ECR, Testing
+
+# Events
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ dev ]
+
+env:
+  ENVIRONMENT: prod
+  CONSUL_HOST: consul-server.consul.svc.cluster.local
+  CONSUL_PORT: 8500
+  SERVICE_CODE: mobius-template-rendering
+  ARTIFACT_RETENTION_DAYS: 10
+  CODE_PATH: /home/runner/work/mobius-template-rendering/mobius-template-rendering
+  SWAGGER_URI: http://ig.gaiansolutions.com/
+  NEXUS_REPO_URL: http://nexus-lib.gaiansolutions.com:8081/repository/releases
+  NEXUS_USERNAME: ${{ secrets.DEV_NEXUS_USERNAME }}
+  NEXUS_PASSWORD: ${{ secrets.DEV_NEXUS_PASSWORD }}
+  BASE_URL: http://ig.gaiansolutions.com
+  DEPLOYMENT_PLATFORM: az
+
+# Workflow defination
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest         
+    outputs:
+      deploymentPlatform: ${{ steps.init.outputs.deploymentPlatform }}
+    
+    steps:        
+      - name: Environment variables to output 
+        id: init
+        run: |
+          echo "deploymentPlatform=${{ env.DEPLOYMENT_PLATFORM }}" >> $GITHUB_OUTPUT
+
+  RUN_ON_AZ:
+    name: RUN_ON_AZ
+    needs: build
+    runs-on: ubuntu-latest
+    
+    if: needs.build.outputs.deploymentPlatform == 'az'
+    
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v2
+
+      - name: Unshallow the checkout
+        run: |
+          git fetch --prune --unshallow --tags
+          git tag --list
+      - name: Install dependencies
+        run: npm i
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker Build, tag, push image to DigitalOcean, and deploy in AKS using kubernetes
+        id: build-image
+        env:
+          ECR_REGISTRY: registry.digitalocean.com/mobius-prod
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT }}
+          IMAGE_TAG: ${{ github.sha }}
+          C_HOST: ${{ env.CONSUL_HOST }}
+          C_PORT: ${{ env.CONSUL_PORT }}
+           
+        run: | 
+
+          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/mobius-template-rendering:$IMAGE_TAG -f docker/Dockerfile .
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/mobius-template-rendering:$IMAGE_TAG
+
+      - name: Update deployment file
+        run: |
+          OLD_CONTENT=$(curl -H "Authorization: Bearer ${{ secrets.K8_REPO_ACCESS_SECRET }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/gaiangroup/k8s-files-dev/contents/dev/deployment/mobius-template-rendering.yml | jq -r .content)
+
+          # Modify the image tag in the OLD_CONTENT
+          NEW_CONTENT=$(echo "$OLD_CONTENT" | base64 -d | sed "s|image: gaianmobius/mobius-template-rendering:[a-zA-Z0-9]*|image: gaianmobius/mobius-template-rendering:${{ github.sha }}|g" | base64 -w0)
+
+          # Fetch the current SHA hash
+          SHA=$(curl -H "Authorization: Bearer ${{ secrets.K8_REPO_ACCESS_SECRET }}" -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/gaiangroup/k8s-files-dev/contents/dev/deployment/mobius-template-rendering.yml | jq -r .sha)
+
+          curl -X PUT \
+            -H "Authorization: Bearer ${{ secrets.K8_REPO_ACCESS_SECRET }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/gaiangroup/k8s-files-dev/contents/dev/deployment/mobius-template-rendering.yml \
+            -d '{
+              "message": "Update deployment image",
+              "content": "'$NEW_CONTENT'",
+              "sha": "'$SHA'",
+              "branch": "qa"
+            }'
+

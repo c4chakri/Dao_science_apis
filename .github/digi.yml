@@ -1,0 +1,377 @@
+# This workflow to test EKS connections and deploy service in kubernetes cluster.
+# Authors : Rahul Upadhyay,Ravi Teja. 
+
+name: CI with Java Spring Boot repo, maven build tool, packaging & pushing as image to ECR, Testing
+
+# Events
+on:
+  push:
+    branches: [ qa ]
+  pull_request:
+    branches: [ qa ]
+
+env:
+  ENVIRONMENT: prod
+  CONSUL_HOST: consul-server.default.svc.cluster.local
+  CONSUL_PORT: 8500
+  SERVICE_CODE: bpmn
+  ARTIFACT_RETENTION_DAYS: 10
+  APM_URL: skywalking-oap.default.svc.cluster.local:11800
+  CODE_PATH: /home/runner/work/bpmn-workflow-designer/bpmn-workflow-designer
+  SWAGGER_URI: http://dev-ingress-gateway.gaiansolutions.com/
+  NEXUS_REPO_URL: http://dev.nexus-lib.gaiansolutions.com:8081/repository/releases
+  NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+  NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+  BASE_URL: http://ingress-gateway.gaiansolutions.com
+  DEPLOYMENT_PLATFORM: do
+
+# Workflow defination
+jobs:
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest         
+    outputs:
+      deploymentPlatform: ${{ steps.init.outputs.deploymentPlatform }}
+    
+    steps:        
+      - name: Environment variables to output 
+        id: init
+        run: |
+          echo "deploymentPlatform=${{ env.DEPLOYMENT_PLATFORM }}" >> $GITHUB_OUTPUT
+
+        
+  RUN_ON_AWS:
+  
+    name: RUN_ON_AWS
+    needs: build
+    runs-on: ubuntu-latest
+      
+    if: needs.build.outputs.deploymentPlatform == 'aws'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        
+        
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v2.0
+        with:
+          version: 'v1.19.15' # default is latest stable  
+        
+      - name: Unshallow the checkout
+        run: |
+          git fetch --prune --unshallow --tags
+          git tag --list
+      - name: Generate Version
+        id: version
+        uses: sceccotti89/Github-Action-Versioning@v1.0.5
+
+      # - name: Print new semantic build number
+      #   run:  echo ${{ steps.version.outputs.version }}
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v1
+        with:
+          java-version: 11
+          # distribution: 'zulu'
+
+      # Step that does that actual cache save and restore
+#       - name: caching dependancies for subsequent runs
+#         uses: actions/cache@v1
+#         with:
+#           path: ~/.m2/repository
+#           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+#           restore-keys: |
+#             ${{ runner.os }}-maven-
+#       - name: Setup Gaian Nexus Repo credentials
+#         uses: s4u/maven-settings-action@v2.4.0
+#         with:
+#           servers: |
+#               [{
+#                 "id": "nexus",
+#                 "username": "${{ secrets.NEXUS_USERNAME }}",
+#                 "password": "${{ secrets.NEXUS_PASSWORD }}"
+#               }]
+#           mirrors: |
+#             [{
+#               "id": "nexus",
+#               "name": "nexus",
+#               "mirrorOf": "nexus",
+#               "url": "${{ env.NEXUS_REPO_URL }}",
+#               "blocked": false
+#             }]
+      #     - name: Run Unit Tests, publish coverage to Sonar DEV edition ( Testing phase )
+      #       run: mvn clean package sonar:sonar -Dsonar.projectKey=gaian -Dsonar.host.url=http://13.233.34.101:9000 -Dsonar.login=91535c270e143610a5511a5969688e9ec8a0c01e
+
+      - name: Run Unit Tests, publish coverage to Sonar
+#         run: mvn clean install sonar:sonar -Dsonar.qualitygate.wait=true -Dsonar.projectKey=template-service-qa -Dsonar.host.url=${{ secrets.SONAR_HOST }} -Dsonar.login=${{ secrets.SONAR_TOKEN }} -Dproject.version=${{ steps.version.outputs.version }}
+        run: mvn clean install -f org.gaian.bpmn/pom.xml
+  
+      - name: Environment variables to output 
+        id: init
+        run: |
+          echo "DEPLOYMENT_PLATFORM=${{ env.DEPLOYMENT_PLATFORM }}" >> $GITHUB_OUTPUT        
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.DEV_EKS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.DEV_EKS_SECRET_KEY }}
+          aws-region: ${{ secrets.DEV_EKS_AWS_REGION }}
+                 
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+       
+      - name: Kubernetes set context
+        uses: Azure/k8s-set-context@v1
+        with:
+         method: kubeconfig
+         kubeconfig: ${{ secrets.DEV_EKS_KUBE_CONFIG }}
+        
+      - name: Docker Build, tag, push image to Amazon ECR, and deploy in EKS using kubernetes
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT }}
+          IMAGE_TAG: bpmn-${{ github.sha }}
+          C_HOST: ${{ env.CONSUL_HOST }}
+          C_PORT: ${{ env.CONSUL_PORT }}
+          APM_URL: ${{ env.APM_URL }} 
+        run: |
+          # Build a docker container and
+          # steps.version.outputs.version
+          # push it to ECR so that it can
+          # be deployed to ECS/EKS
+          sed -i'' -e "s/\$consul_url/$C_HOST/g" -e "s/\$consul_port/$C_PORT/g" -e "s/ENVIRONMENT/$ECR_REPOSITORY/g" -e "s/\$apm_url/$APM_URL/g" docker/startup.sh
+          echo $ECR_REGISTRY
+          echo $ECR_REPOSITORY
+          echo $IMAGE_TAG          
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          ##### replacing image tag and registry inside deployment file
+          sed -i'' -e "s|REG|$ECR_REGISTRY|g" -e "s|IMAGE|$ECR_REPOSITORY|g" -e "s|TAG|$IMAGE_TAG|g" kubernetes-files/deployment.yaml
+          kubectl apply -f kubernetes-files/deployment.yaml
+          kubectl apply -f kubernetes-files/istio-rules.yaml
+    
+      - name: Check pods after apply
+        run: kubectl get pods
+          
+          
+    
+  RUN_ON_DO:
+  
+    name: RUN_ON_DO
+    needs: build
+    runs-on: ubuntu-latest
+    
+    if: needs.build.outputs.deploymentPlatform == 'do'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        
+        
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v2.0
+        with:
+          version: 'v1.19.15' # default is latest stable  
+        
+      - name: Unshallow the checkout
+        run: |
+          git fetch --prune --unshallow --tags
+          git tag --list
+      - name: Generate Version
+        id: version
+        uses: sceccotti89/Github-Action-Versioning@v1.0.5
+
+      # - name: Print new semantic build number
+      #   run:  echo ${{ steps.version.outputs.version }}
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v1
+        with:
+          java-version: 11
+          # distribution: 'zulu'
+
+      # Step that does that actual cache save and restore
+
+      - name: caching dependancies for subsequent runs
+        uses: actions/cache@v1
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+      - name: Setup Gaian Nexus Repo credentials
+        uses: s4u/maven-settings-action@v2.4.0
+        with:
+          servers: |
+              [{
+                "id": "nexus",
+                "username": "${{ secrets.NEXUS_USERNAME }}",
+                "password": "${{ secrets.NEXUS_PASSWORD }}"
+              }]
+          mirrors: |
+            [{
+              "id": "nexus",
+              "name": "nexus",
+              "mirrorOf": "nexus",
+              "url": "${{ env.NEXUS_REPO_URL }}",
+              "blocked": false
+            }]
+      #     - name: Run Unit Tests, publish coverage to Sonar DEV edition ( Testing phase )
+      #       run: mvn clean package sonar:sonar -Dsonar.projectKey=gaian -Dsonar.host.url=http://13.233.34.101:9000 -Dsonar.login=91535c270e143610a5511a5969688e9ec8a0c01e
+
+      - name: Run Unit Tests, publish coverage to Sonar
+#         run: mvn clean install sonar:sonar -Dsonar.qualitygate.wait=true -Dsonar.projectKey=template-service-qa -Dsonar.host.url=${{ secrets.SONAR_HOST }} -Dsonar.login=${{ secrets.SONAR_TOKEN }} -Dproject.version=${{ steps.version.outputs.version }}
+        run: mvn clean install -f org.gaian.bpmn/pom.xml
+  
+      - name: Environment variables to output 
+        id: init
+        run: |
+          echo "DEPLOYMENT_PLATFORM=${{ env.DEPLOYMENT_PLATFORM }}" >> $GITHUB_OUTPUT        
+  
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}       
+    
+      - name: Log in to DigitalOcean Container Registry with short-lived credentials
+        run: doctl registry login --expiry-seconds 600
+
+      - name: Save DigitalOcean kubeconfig with short-lived credentials
+        run: doctl kubernetes cluster kubeconfig save --expiry-seconds 600 mobius-eks          
+
+      - name: Docker Build, tag, push image to Amazon ECR, and deploy in EKS using kubernetes
+        id: build-image
+        env:
+          ECR_REGISTRY: registry.digitalocean.com/mobius-qa
+          ECR_REPOSITORY: ${{ env.ENVIRONMENT }}
+          IMAGE_TAG: bpmn-${{ github.sha }}
+          C_HOST: ${{ env.CONSUL_HOST }}
+          C_PORT: ${{ env.CONSUL_PORT }}
+          APM_URL: ${{ env.APM_URL }}    
+        run: |
+          # Build a docker container and
+          # steps.version.outputs.version
+          # push it to ECR so that it can
+          # be deployed to ECS/EKS
+          sed -i'' -e "s/\$consul_url/$C_HOST/g" -e "s/\$consul_port/$C_PORT/g" -e "s/ENVIRONMENT/$ECR_REPOSITORY/g" -e "s/\$apm_url/$APM_URL/g" docker/startup.sh
+          echo $ECR_REGISTRY
+          echo $ECR_REPOSITORY
+          echo $IMAGE_TAG          
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          ##### replacing image tag and registry inside deployment file
+          sed -i'' -e "s|REG|$ECR_REGISTRY|g" -e "s|IMAGE|$ECR_REPOSITORY|g" -e "s|TAG|$IMAGE_TAG|g" kubernetes-files/deployment.yaml
+          kubectl apply -f kubernetes-files/deployment.yaml
+          kubectl apply -f kubernetes-files/istio-rules.yaml
+    
+      - name: Check pods after apply
+        run: kubectl get pods
+
+#       - name: wait for swagger to come up
+#         uses: cygnetdigital/wait_for_response@v2.0.0
+#         with:
+#           url: https://dev-ingress-gateway.gaiansolutions.com/${{ env.SERVICE_CODE }}/swagger-ui.html
+#           responseCode: 200
+#           timeout: 300000
+#           interval: 5000
+
+#   PERFORMANCE_TEST:
+#     runs-on: ubuntu-latest
+#     needs: Build
+#     steps:       
+#       - name: Checkout COE repo
+#         uses: actions/checkout@v2
+#         with:
+#           repository: gaiangroup/gaian-test-automation 
+#           token: '${{ secrets.GITACTIONS_PAT }}'
+#           ref: integration
+#           path: coe
+        
+#       - name: Jmeter test
+#         uses: rbhadti94/apache-jmeter-action@v0.3.2
+#         with:
+#           testFilePath: coe/Perf-Test/TemplateService/Template_Benchmarking.jmx
+#           outputReportsFolder: reports/
+#           args: "-JURI=dev-ingress-gateway.gaiansolutions.com"
+        
+#       - name: Get data from Skywalking
+#         run: curl -X POST "http://65.1.154.213:8080/skywalking/dump?serviceName=${{env.SERVICE_CODE}}"
+        
+#       - name: Explore Reports
+#         run: | 
+#           sudo cp jmeter_log.log reports/
+#           sudo cp reports/statistics.json coe/kpi-metrics
+#           ls -la reports/
+#           ls -la coe/kpi-metrics
+#           cat jmeter_log.log
+#       - name: Retain Jmeter Reports
+#         uses: actions/upload-artifact@v2
+#         with:
+#           name: Perf_Reports
+#           path: reports/
+#           retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+#           if-no-files-found: error
+          
+#       - name: Push load test run to kpi DB
+#         run: | 
+#           cd coe/kpi-metrics
+#           npm i
+#           service_code=${{env.SERVICE_CODE}} build_version=${{ github.sha }} node send_Data.js
+#   COE_ANALYSIS:
+#     runs-on: ubuntu-latest
+#     needs: Build
+
+#     steps:
+#       - name: Checkout
+#         uses: actions/checkout@v2
+        
+#       - name: Unshallow the checkout
+#         run: |
+#           git fetch --prune --unshallow --tags
+#           git tag --list
+        
+#       - name: Checkout COE repo
+#         uses: actions/checkout@v2
+#         with:
+#           repository: gaiangroup/gaian-test-automation 
+#           token: '${{ secrets.GITACTIONS_PAT }}'
+#           ref: integration
+#           path: coe
+          
+#       - name: Run COE Analysis Check & Publish to Portal
+#         id: coe
+# #         continue-on-error: true
+#         run: |
+#           pwd
+#           cd coe/coe-analysis/
+#           npm i
+#           service_code=${{env.SERVICE_CODE}} build_version=${{ github.sha }} code_path=${{ env.CODE_PATH }} SwaggerURI=${{  env.SWAGGER_URI }} node app.js
+#       - name: Configure AWS credentials
+#         uses: aws-actions/configure-aws-credentials@v1
+  
+#         with:
+#           aws-access-key-id: ${{ secrets.DEV_EKS_ACCESS_KEY }}
+#           aws-secret-access-key: ${{ secrets.DEV_EKS_SECRET_KEY }}
+#           aws-region: ${{ secrets.DEV_EKS_AWS_REGION }}
+
+#       - name: Login to Amazon ECR
+#         id: login-ecr
+#         uses: aws-actions/amazon-ecr-login@v1
+
+#       - name: Kubernetes set context
+#         uses: Azure/k8s-set-context@v1
+#         with:
+#           method: kubeconfig
+#           kubeconfig: ${{ secrets.DEV_EKS_KUBE_CONFIG }}
+
+#       - name: Delete the pod
+#         if: steps.coe.outcome != 'success'
+#         run: kubectl delete -f kubernetes-files/deployment.yaml    
